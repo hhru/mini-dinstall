@@ -1,3 +1,9 @@
+mini-dinstall (0.6.31+hh3) unstable; urgency=medium
+
+  * mini-dinstall: Add atomic indexes option, return gz and bz2 package files
+
+ --  <d.smirnov@hh.ru>  Mon, 20 Aug 2018 19:01:29 +0300
+
 mini-dinstall (0.6.31) unstable; urgency=medium
 
   [ Unit 193 ]

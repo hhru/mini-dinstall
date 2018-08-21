@@ -18,7 +18,7 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 
-import os, sys, re, glob, getopt, time, traceback, lzma, getpass, socket
+import os, sys, re, glob, getopt, time, traceback, gzip, bz2, lzma, getpass, socket
 import shutil, signal, threading, select, Queue, SocketServer, datetime
 import logging, logging.handlers
 #logging.basicConfig()
@@ -85,6 +85,16 @@ Changes:
 
 tweet_template = "Installed %(source)s %(version)s to %(distribution)s"
 
+tmp_file_prefix = 'tmp_'
+
+fileset = {
+    'pkgsfile': ['Packages', tmp_file_prefix + 'Packages'],
+    'srcsfile': ['Sources', tmp_file_prefix + 'Sources'],
+    'releasefile': ['Release', tmp_file_prefix + 'Release'],
+    'contentsfile': ['Contents', tmp_file_prefix + 'Contents'],
+}
+
+
 def usage(ecode, ver_only=None):
     print "mini-dinstall", pkg_version
     if ver_only:
@@ -93,7 +103,7 @@ def usage(ecode, ver_only=None):
     print "Licensed under the GNU GPL."
     print "Usage: mini-dinstall [OPTIONS...] [DIRECTORY]"
     print "Options:"
-    print "  -v, --verbose\t\tDisplay extra information"
+    print "  -v, \t\tDisplay extra information"
     print "  -q, --quiet\t\tDisplay less information"
     print "  -c, --config=FILE\tParse configuration info from FILE"
     print "  -d, --debug\t\tOutput information to stdout as well as log"
@@ -401,6 +411,7 @@ class DistOptionHandler:
         self._optionmap['extra_keyrings'] = ['list', None]
         self._optionmap['verify_sigs'] = ['bool', 0]
         self._optionmap['use_byhash'] = ['bool', 1]
+        self._optionmap['atomic_release'] = ['bool', self._optionmap['generate_release'][1]]
 
     def get_option_map(self, dist):
         ret = self._distributions[dist]
@@ -1153,13 +1164,21 @@ class ArchiveDirIndexer(threading.Thread):
         else:
             packagesfilename = os.path.join(dir, name)
         newpackagesfilename = packagesfilename + '.new'
+        zpackagesfilename = packagesfilename + '.gz'
+        bz2packagesfilename = packagesfilename + '.bz2'
         xzpackagesfilename = packagesfilename + '.xz'
+        newzpackagesfilename = newpackagesfilename + '.gz'
+        newbz2packagesfilename = newpackagesfilename + '.bz2'
         newxzpackagesfilename = newpackagesfilename + '.xz'
         newpackagesfile = open(newpackagesfilename, 'w')
+        newzpackagesfile = gzip.GzipFile(newzpackagesfilename, 'w')
+        newbz2packagesfile = bz2.BZ2File(newbz2packagesfilename, 'w')
         newxzpackagesfile = lzma.LZMAFile(newxzpackagesfilename, 'w')
         buf = stdout.read(8192)
         while buf != '':
             newpackagesfile.write(buf)
+            newzpackagesfile.write(buf)
+            newbz2packagesfile.write(buf)
             newxzpackagesfile.write(buf)
             buf = stdout.read(8192)
         stdout.close()
@@ -1167,8 +1186,12 @@ class ArchiveDirIndexer(threading.Thread):
         if not (status is None or (os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0)):
             raise DinstallException("apt-ftparchive exited with status code %d" % (status,))
         newpackagesfile.close()
+        newzpackagesfile.close()
+        newbz2packagesfile.close()
         newxzpackagesfile.close()
         shutil.move(newpackagesfilename, packagesfilename)
+        shutil.move(newzpackagesfilename, zpackagesfilename)
+        shutil.move(newbz2packagesfilename, bz2packagesfilename)
         shutil.move(newxzpackagesfilename, xzpackagesfilename)
         if self._use_byhash:
             for hash in [ 'sha256' ]:
@@ -1183,13 +1206,13 @@ class ArchiveDirIndexer(threading.Thread):
                     os.remove(os.path.join(hashdir,oldbyhash))
 
     def _make_packagesfile(self, dir):
-        self._make_indexfile(dir, 'packages', 'Packages')
+        self._make_indexfile(dir, 'packages', fileset['pkgsfile'][self._atomic_release])
 
     def _make_sourcesfile(self, dir):
-        self._make_indexfile(dir, 'sources', 'Sources')
+        self._make_indexfile(dir, 'sources', fileset['srcsfile'][self._atomic_release])
 
     def _make_contentsfile(self, dir, arch):
-        self._make_indexfile(dir, 'contents', 'Contents', arch)
+        self._make_indexfile(dir, 'contents', fileset['contentsfile'][self._atomic_release], arch)
 
     def _sign_releasefile(self, name, dir):
         if self._release_signscript:
@@ -1244,7 +1267,11 @@ class ArchiveDirIndexer(threading.Thread):
             absfile = self._abspath(file)
             h = self._get_file_sum(hash, absfile)
             size = os.stat(absfile)[stat.ST_SIZE]
-            f.write(' %s% 16d %s\n' % (h, size, os.path.basename(absfile)))
+            if self._atomic_release:
+                filename = os.path.basename(absfile).replace(tmp_file_prefix, '')
+            else:
+                filename = os.path.basename(absfile)
+            f.write(' %s% 16d %s\n' % (h, size, filename))
 
     def _index_all(self, force=None):
         self._index(self._arches + ['source'], force)
@@ -1252,12 +1279,16 @@ class ArchiveDirIndexer(threading.Thread):
     def _gen_release_all(self, force=False):
         self._gen_release(self._arches, force)
 
+    def _sync_files_all(self):
+        self._sync_impl(self._arches)
+
     def run(self):
         self._logger.info('Created new thread (%s) for archive indexer %s' % (self.getName(), self._name,))
         self._logger.info('Entering batch mode...')
         try:
             self._index_all(1)
             self._gen_release_all(True)
+            self._sync_files_all()
             if not self._batch_mode:
                 # never returns
                 self._daemonize()
@@ -1317,10 +1348,12 @@ class ArchiveDirIndexer(threading.Thread):
                 self._logger.debug('Got general change')
                 self._index_all(1)
                 self._gen_release_all(True)
+                self._sync_files_all()
             else:
                 self._logger.debug('Got change in %s' % (dir,))
                 self._index([os.path.basename(os.path.abspath(dir))])
                 self._gen_release([os.path.basename(os.path.abspath(dir))])
+                self._sync_impl([os.path.basename(os.path.abspath(dir))])
             if setevent:
                 self._logger.debug('setting wait_reprocess event')
                 setevent.set()
@@ -1368,7 +1401,7 @@ class SimpleSubdirArchiveDirIndexer(ArchiveDirIndexer):
         for arch in arches:
             dirmtime = os.stat(self._relpath(arch))[stat.ST_MTIME]
             if arch != 'source':
-                pkgsfile = self._relpath(arch, 'Packages')
+                pkgsfile = self._relpath(arch, fileset['pkgsfile'][self._atomic_release])
                 if force or (not os.access(pkgsfile, os.R_OK)) or dirmtime > os.stat(pkgsfile)[stat.ST_MTIME]:
                     self._logger.info('Generating Packages file for %s...' % (arch,))
                     self._make_packagesfile(self._relpath(arch))
@@ -1377,7 +1410,7 @@ class SimpleSubdirArchiveDirIndexer(ArchiveDirIndexer):
                     self._logger.info('Skipping generation of Packages file for %s' % (arch,))
 
             else:
-                pkgsfile = self._relpath(arch, 'Sources')
+                pkgsfile = self._relpath(arch, fileset['srcsfile'][self._atomic_release])
                 if force or (not os.access(pkgsfile, os.R_OK)) or dirmtime > os.stat(pkgsfile)[stat.ST_MTIME]:
                     self._logger.info('Generating Sources file for %s...' % (arch,))
                     self._make_sourcesfile(self._relpath('source'))
@@ -1385,9 +1418,33 @@ class SimpleSubdirArchiveDirIndexer(ArchiveDirIndexer):
                 else:
                     self._logger.info('Skipping generation of Sources file for %s' % (arch,))
 
+    def _sync_impl(self, arches):
+        if not self._atomic_release:
+            self._logger.debug("NOT Atomic release. No need to do anything")
+            return
+        self._logger.debug("Atomic release. Syncing indexes")
+        comprexts = ['', '.gz', '.bz2', '.xz']
+        for arch in arches:
+            for type in fileset.keys():
+                for ext in comprexts:
+                    movingfile = self._relpath(arch, fileset[type][1]) + ext
+                    tmpfile = movingfile + '.1'
+                    if os.access(movingfile, os.R_OK):
+                        self._logger.debug("Copying: {0} to {1}".format(movingfile, tmpfile))
+                        shutil.copyfile(movingfile, tmpfile)
+        for arch in arches:
+            for type in fileset.keys():
+                for ext in comprexts:
+                    movingfile = self._relpath(arch, fileset[type][1]) + ext
+                    tmpfile = movingfile + '.1'
+                    resultfile = self._relpath(arch, fileset[type][0]) + ext
+                    if os.access(movingfile, os.R_OK):
+                        self._logger.debug("Moving: {0} to {1}".format(tmpfile, resultfile))
+                        os.rename(tmpfile, resultfile)
+
     def _gen_release_impl(self, arches, force):
         for arch in arches:
-            targetname = self._relpath(arch, 'Release')
+            targetname = self._relpath(arch, fileset['releasefile'][self._atomic_release])
             if not self._generate_release:
                 if os.access(targetname, os.R_OK):
                     self._logger.info("Release generation disabled, removing existing Release file")
@@ -1398,9 +1455,9 @@ class SimpleSubdirArchiveDirIndexer(ArchiveDirIndexer):
                 return
             tmpname = targetname + tmp_new_suffix
             release_needed = 0
-            uncompr_indexfile = os.path.join(arch, 'Packages')
+            uncompr_indexfile = os.path.join(arch, fileset['pkgsfile'][self._atomic_release])
             indexfiles =  [uncompr_indexfile]
-            comprexts = ['.xz']
+            comprexts = ['.gz', '.bz2', '.xz']
             for ext in comprexts:
                 indexfiles = indexfiles + [uncompr_indexfile + ext]
             if os.access(targetname, os.R_OK):
@@ -1460,14 +1517,14 @@ class SimpleSubdirArchiveDirIndexer(ArchiveDirIndexer):
         return map(lambda x, self=self: self._abspath(x), self._arches + ['source'])
 
     def _get_all_indexfiles(self):
-        return map(lambda arch: os.path.join(arch, 'Packages'), self._arches) + ['source/Sources']
+        return map(lambda arch: os.path.join(arch, fileset['pkgsfile'][self._atomic_release]), self._arches) + ['source/Sources']
 
 class FlatArchiveDirIndexer(ArchiveDirIndexer):
     def __init__(self, *args, **kwargs):
         apply(ArchiveDirIndexer.__init__, [self] + list(args), kwargs)
 
     def _index_impl(self, arches, force=None):
-        pkgsfile = self._abspath('Packages')
+        pkgsfile = self._abspath(fileset['pkgsfile'][self._atomic_release])
         dirmtime = os.stat(self._relpath())[stat.ST_MTIME]
         if force or (not os.access(pkgsfile, os.R_OK)) or dirmtime > os.stat(pkgsfile)[stat.ST_MTIME]:
             self._logger.info('Generating Packages file...')
@@ -1475,7 +1532,7 @@ class FlatArchiveDirIndexer(ArchiveDirIndexer):
             self._logger.info('Packages generation complete')
         else:
             self._logger.info('Skipping generation of Packages file')
-        pkgsfile = self._abspath('Sources')
+        pkgsfile = self._abspath(fileset['srcsfile'][self._atomic_release])
         if force or (not os.access(pkgsfile, os.R_OK)) or dirmtime > os.stat(pkgsfile)[stat.ST_MTIME]:
             self._logger.info('Generating Sources file...')
             self._make_sourcesfile(self._relpath())
@@ -1486,7 +1543,7 @@ class FlatArchiveDirIndexer(ArchiveDirIndexer):
         for arch in self._arches:
             if arch == "all" or arch == "source":
                 continue
-            pkgsfile = self._abspath('Contents-%s' % arch)
+            pkgsfile = self._abspath('%s-%s' % (fileset['contentsfile'][self._atomic_release], arch))
             if force or (not os.access(pkgsfile, os.R_OK)) or dirmtime > os.stat(pkgsfile)[stat.ST_MTIME]:
                 self._logger.info('Generating Contents file...')
                 self._make_contentsfile(self._relpath(), arch)
@@ -1495,7 +1552,7 @@ class FlatArchiveDirIndexer(ArchiveDirIndexer):
                 self._logger.info('Skipping generation of Contents file')
 
     def _gen_release_impl(self, arches, force):
-        targetname = self._abspath('Release')
+        targetname = self._abspath(fileset['releasefile'][self._atomic_release])
         if not self._generate_release:
             if os.access(targetname, os.R_OK):
                 self._logger.info("Release generation disabled, removing existing Release file")
@@ -1508,7 +1565,7 @@ class FlatArchiveDirIndexer(ArchiveDirIndexer):
         release_needed = 0
         uncompr_indexfiles = self._get_all_indexfiles()
         indexfiles = []
-        comprexts = ['.xz']
+        comprexts = ['.gz', '.bz2', '.xz']
         for index in uncompr_indexfiles:
             indexfiles = indexfiles + [index]
             for ext in comprexts:
@@ -1563,6 +1620,39 @@ class FlatArchiveDirIndexer(ArchiveDirIndexer):
             os.rename(tmpname, targetname)
             self._logger.info("Release generation complete")
 
+    def _sync_impl(self, arches):
+        if not self._atomic_release:
+            self._logger.debug("NOT Atomic release. No need to do anything")
+            return
+        self._logger.debug("Atomic release. Syncing indexes")
+
+        files_from = [self._abspath(fileset[t][1]) for t in ['pkgsfile', 'srcsfile', 'releasefile']]
+        files_to = [self._abspath(fileset[t][0]) for t in ['pkgsfile', 'srcsfile', 'releasefile']]
+
+        for arch in self._arches:
+            if arch == "all" or arch == "source":
+                continue
+            files_from.append("%s-%s" % (self._abspath(fileset['contentsfile'][1]), arch))
+            files_to.append("%s-%s" % (self._abspath(fileset['contentsfile'][0]), arch))
+
+        comprexts = ['', '.gz', '.bz2', '.xz']
+        for filepath in files_from:
+            for ext in comprexts:
+                movingfile = filepath + ext
+                tmpfile = movingfile + '.1'
+                if os.access(movingfile, os.R_OK):
+                    self._logger.debug("Copying: {0} to {1}".format(movingfile, tmpfile))
+                    shutil.copyfile(movingfile, tmpfile)
+
+        for filepath_from, filepath_to in zip(files_from, files_to):
+            for ext in comprexts:
+                movingfile = filepath_from + ext
+                tmpfile = movingfile + '.1'
+                resultfile = filepath_to + ext
+                if os.access(movingfile, os.R_OK):
+                    self._logger.debug("Moving: {0} to {1}".format(tmpfile, resultfile))
+                    os.rename(tmpfile, resultfile)
+
     def _in_archdir(self, *args):
         return apply(lambda x,self=self: self._abspath(x), args[1:])
 
@@ -1574,8 +1664,8 @@ class FlatArchiveDirIndexer(ArchiveDirIndexer):
         for arch in self._arches:
             if arch == "all" or arch == "source":
                 continue
-            allindexes += ["Contents-%s" % arch]
-        return ['Packages', 'Sources'] + allindexes
+            allindexes += ["%s-%s" % (fileset['contentsfile'][self._atomic_release], arch)]
+        return [fileset['pkgsfile'][self._atomic_release], fileset['srcsfile'][self._atomic_release]] + allindexes
 
 if os.access(lockfilename, os.R_OK):
     logger.critical("lockfile \"%s\" exists (pid %s): is another mini-dinstall running?"  % (lockfilename, open(lockfilename).read(10)))
